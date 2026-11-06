@@ -1,0 +1,19 @@
+# Optional local database only. Never expose the port on a public interface.
+services:
+  postgres:
+    image: postgres:17
+    ports:
+      - "127.0.0.1:55439:5432"
+    environment:
+      POSTGRES_USER: speech
+      POSTGRES_DB: speech
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a local password in .env}
+    volumes:
+      - speech-local-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U speech -d speech"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  speech-local-pg:

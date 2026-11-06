@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.egg-info/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Datasets, model weights and experiment outputs
+data/raw/**
+data/processed/**
+models/**
+experiments/**
+data/private-audio/
+out/
+*.log
+
+# Local assistant indexes and working artifacts
+.claude/
+.codegraph/
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Diagram PDF export dependencies
+node_modules/

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Speech & Grammar · Local test-double demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header><p class="eyebrow">ENGLISH PRACTICE / LOCAL LAB</p><h1>Speak. Review. Refine.</h1>
+<p>A small, private workflow for testing the learning experience.</p></header>
+<aside class="banner" aria-label="Test double disclaimer"><strong>FAKE / TEST DOUBLE DEMO</strong>
+<p>No real language models run here. ASR always returns a canned sentence; grammar has only two examples. Pronunciation is not assessed and has no score. This is not evidence of ML quality.</p></aside>
+<main id="main">
+  <p id="status" role="status" aria-live="polite" aria-atomic="true">Connecting…</p>
+  <section id="auth" aria-labelledby="auth-title">
+    <h2 id="auth-title">Your local account</h2>
+    <form id="auth-form">
+      <label for="email">Email</label><input id="email" type="email" autocomplete="username" required maxlength="254">
+      <label for="password">Password <span class="hint">12–128 characters</span></label><input id="password" type="password" autocomplete="current-password" minlength="12" maxlength="128" required>
+      <div class="actions"><button type="submit" name="action" value="login">Log in</button><button type="submit" name="action" value="register" class="secondary">Create account</button></div>
+    </form>
+  </section>
+  <div id="workspace" hidden>
+    <nav class="actions" aria-label="Account"><button id="logout" class="secondary">Log out</button><button id="delete-account" class="danger">Delete account</button></nav>
+    <div class="layout">
+      <div>
+        <section aria-labelledby="new-title">
+          <h2 id="new-title">1. Start a practice</h2>
+          <details><summary>Local processing & deletion policy (local-v1)</summary>
+            <p>Audio and text are processed only on this computer; no external inference services or training. Email is used for login. Private WAV files are kept under the configured local storage directory, not publicly served. Maximum audio: 30 seconds and 10 MiB.</p>
+            <p>Run the separate cleanup scheduler: it removes audio and all session content after 24 hours (text-only sessions expire after 24 hours too). While the computer or scheduler is off, scheduled deletion cannot run; overdue content is removed on its next run. Delete a session or account sooner whenever needed.</p>
+            <p>No anonymization has been validated, so this demo deletes expired content even if optional retention is selected. No backups are configured by the demo; any operator-created backups may retain deleted data until they expire. Do not upload sensitive or unconsented speech.</p>
+          </details>
+          <form id="practice-form">
+            <label class="check"><input id="consent" type="checkbox" required> I have read local-v1 and agree to local server processing.</label>
+            <label class="check"><input id="retain" type="checkbox"> Optional: allow anonymized derivatives. <span class="hint">Not retained by this demo.</span></label>
+            <label for="mode">Practice mode</label><select id="mode"><option value="grammar_only">Grammar — my own text / speech</option><option value="reference_reading">Pronunciation — read a reference</option></select>
+            <div id="reference-area" hidden><label for="reference">Reference to read (not grammar evidence)</label><textarea id="reference" maxlength="3000" rows="2"></textarea></div>
+            <button type="submit">Agree & create practice</button>
+          </form>
+        </section>
+        <section id="editor" hidden aria-labelledby="editor-title">
+          <h2 id="editor-title" tabindex="-1">2. Review your words</h2>
+          <p id="revision" class="hint"></p>
+          <form id="upload-form">
+            <label for="audio">Optional audio — WAV PCM16, mono, 16 kHz only</label>
+            <p id="audio-help" class="hint">Up to 30 seconds / 10 MiB. No microphone recording or codec conversion in this slice. The separate worker must be running.</p>
+            <input id="audio" type="file" accept="audio/wav,.wav" aria-describedby="audio-help">
+            <button type="submit" class="secondary">Upload & queue FAKE speech analysis</button>
+          </form>
+          <label for="transcript">Your draft / edited transcript</label><textarea id="transcript" rows="5" maxlength="3000" aria-describedby="transcript-help"></textarea>
+          <p id="transcript-help" class="hint">ASR is a canned draft, not what you actually said. Save, then explicitly confirm the exact revision before grammar analysis. Editing invalidates confirmation.</p>
+          <div class="actions"><button id="save">Save draft</button><button id="confirm" class="secondary">Confirm saved revision</button><button id="analyze" disabled>Queue FAKE grammar</button><button id="reload" class="secondary">Reload saved draft</button></div>
+        </section>
+        <section id="results" hidden aria-labelledby="results-title">
+          <h2 id="results-title">3. Feedback & job status</h2>
+          <p id="report-state"></p><div id="job-list"></div><div id="feedback"></div>
+          <div class="actions"><button id="refresh" class="secondary">Refresh report</button><button id="export" class="secondary">Export content-free JSON</button><button id="delete-session" class="danger">Delete this practice</button></div>
+        </section>
+      </div>
+      <aside class="history" aria-labelledby="history-title"><h2 id="history-title">Your history</h2><p class="hint">Only your unexpired, undeleted practices.</p><button id="history-refresh" class="secondary">Refresh history</button><ul id="history-list"></ul></aside>
+    </div>
+  </div>
+</main>
+<footer>Local vertical slice · staging, real-model pilot and research evaluation are not implemented.</footer>
+</body>
+</html>
