@@ -24,6 +24,56 @@
 | Phát âm | Trả phản hồi giả lập, không có điểm đánh giá đã hiệu chuẩn |
 | Tổng hợp phản hồi | Giữ riêng bằng chứng từng thành phần và gắn nhãn FAKE |
 
+## Ảnh giao diện và chức năng
+
+Ảnh chụp trực tiếp từ ứng dụng local đang chạy, sử dụng tài khoản thử, văn bản ví dụ và WAV tổng hợp. Không có dữ liệu cá nhân thật. Nhãn **FAKE / TEST DOUBLE** được giữ nguyên: ảnh minh họa luồng phần mềm, không chứng minh chất lượng mô hình.
+
+![Màn hình đăng nhập và đăng ký tài khoản local](assets/screenshots/01-login.png)
+
+| Màn hình / chức năng | Ảnh thực tế |
+|---|---|
+| Đăng ký, đăng nhập | [01 — Tài khoản local](assets/screenshots/01-login.png) |
+| Chính sách xử lý dữ liệu, consent và tạo phiên | [02 — Bắt đầu luyện tập](assets/screenshots/02-consent-and-practice.png) |
+| Nhập văn bản, lưu nháp và xác nhận revision | [03 — Xác nhận transcript](assets/screenshots/03-confirm-transcript.png) |
+| Worker hoàn tất job, phản hồi ngữ pháp giả lập | [04 — Kết quả ngữ pháp](assets/screenshots/04-grammar-feedback.png) |
+| Đọc câu mẫu và chọn file WAV | [05 — Upload audio](assets/screenshots/05-reference-audio-upload.png) |
+| Transcript ASR mẫu và phản hồi phát âm không có điểm | [06 — Kết quả speech giả lập](assets/screenshots/06-speech-feedback.png) |
+| Chọn phiên cũ trong lịch sử và xem lại báo cáo | [07 — Lịch sử và báo cáo](assets/screenshots/07-history-and-report.png) |
+| Bố cục màn hình hẹp 390 px | [08 — Giao diện mobile](assets/screenshots/08-mobile.png) |
+| Xóa phiên và cập nhật lịch sử | [09 — Đã xóa phiên](assets/screenshots/09-practice-deleted.png) |
+| Xóa tài khoản và trở về màn hình đăng nhập | [10 — Đã xóa tài khoản](assets/screenshots/10-account-deleted.png) |
+
+<details>
+<summary>Xem ảnh kết quả ngữ pháp và trạng thái job</summary>
+
+Văn bản đã xác nhận `He go home.` được test double trả gợi ý định sẵn `He goes home.`; job hiển thị `succeeded`.
+
+![Kết quả ngữ pháp giả lập và trạng thái worker](assets/screenshots/04-grammar-feedback.png)
+
+</details>
+
+<details>
+<summary>Xem ảnh upload WAV, ASR và phát âm giả lập</summary>
+
+Phiên đọc mẫu sử dụng WAV tổng hợp. ASR trả câu cố định; phần phát âm ghi rõ không có điểm hoặc đánh giá âm học thực tế.
+
+![Chọn WAV cho phiên đọc câu mẫu](assets/screenshots/05-reference-audio-upload.png)
+
+![Kết quả speech với cảnh báo FAKE pronunciation](assets/screenshots/06-speech-feedback.png)
+
+</details>
+
+<details>
+<summary>Xem giao diện mobile</summary>
+
+Ảnh chụp viewport rộng 390 px; luồng thử không phát hiện tràn ngang.
+
+<img src="assets/screenshots/08-mobile.png" alt="Giao diện mobile gồm tạo phiên, transcript, phản hồi và lịch sử" width="390">
+
+</details>
+
+Trong phiên chạy chụp ảnh đã kiểm tra đăng ký/đăng nhập, consent, lưu/xác nhận văn bản, job ngữ pháp, upload WAV, ASR/phát âm giả lập, lịch sử, tải JSON kỹ thuật không chứa nội dung văn bản, đăng xuất, xóa phiên và xóa tài khoản. Không ghi nhận lỗi JavaScript `pageerror`; tài khoản thử đã được xóa sau khi chụp. Scheduler cleanup không được chứng minh bằng các ảnh giao diện này.
+
 ## Công nghệ
 
 - **Backend:** Python 3.12–3.13, FastAPI, Pydantic Settings, Uvicorn.
