@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
-from src.api.config import FAKE_WARNING, Settings
+from src.api.config import FAKE_WARNING, PARTIAL_WARNING, REAL_WARNING, Settings
 from src.api.models import (
     AudioAsset,
     Consent,
@@ -23,7 +23,22 @@ from src.api.models import (
 )
 from src.api.storage import digest, private_path
 
-ADAPTER_CONFIG = {"backend": "fake-v1", "fusion": "separate-evidence-v1", "seed": 42}
+MAX_ATTEMPTS = 3
+
+
+def adapter_config(settings: Settings) -> dict:
+    """Pure data shared by enqueue, save_audio and the worker's CONFIG_MISMATCH check."""
+    config = {"fusion": "separate-evidence-v1", "seed": 42}
+    if settings.adapter_backend == "real":
+        return config | {
+            "backend": "real-asr-grammar-v1",
+            "stages": {"asr": "faster-whisper", "pronunciation": "fake", "grammar": "t5-gec"},
+            "asr_model": Path(settings.asr_model).name,
+            "asr_revision": settings.asr_revision,
+            "grammar_model": Path(settings.grammar_model).name,
+            "grammar_revision": settings.grammar_revision,
+        }
+    return config | {"backend": "fake-v1", "stages": {}}
 
 
 def canonical_hash(value: dict) -> str:
@@ -76,6 +91,7 @@ def session_view(value: PracticeSession) -> dict:
         name: getattr(value, name)
         for name in (
             "id",
+            "consent_id",
             "created_at",
             "updated_at",
             "mode",
@@ -101,8 +117,11 @@ def job_view(value: Job) -> dict:
         "finished_at": value.finished_at,
         "stages": value.stage_state_json,
         "error_code": value.error_code,
-        "fake": True,
-        "warning": FAKE_WARNING,
+        "attempt_no": value.attempt_no,
+        "max_attempts": MAX_ATTEMPTS,
+        "retry_of_job_id": value.retry_of_job_id,
+        "fake": value.provenance_json.get("fake", True),
+        "warning": value.provenance_json.get("warning", FAKE_WARNING),
     }
 
 
@@ -138,12 +157,21 @@ def enqueue(
     key: str,
     snapshot: dict,
     asset: AudioAsset | None = None,
+    retry_of: Job | None = None,
 ) -> Job:
     active_consent(db, practice)
-    config_hash = canonical_hash(ADAPTER_CONFIG)
-    request_hash = canonical_hash(
-        {"kind": kind, "session_id": practice.id, "snapshot": snapshot, "config": config_hash}
-    )
+    config = adapter_config(settings)
+    config_hash = canonical_hash(config)
+    real = config["backend"] != "fake-v1"
+    identity = {
+        "kind": kind,
+        "session_id": practice.id,
+        "snapshot": snapshot,
+        "config": config_hash,
+    }
+    if retry_of:  # only when retrying, so normal hashes still match save_audio
+        identity["retry_of"] = retry_of.id
+    request_hash = canonical_hash(identity)
     previous = existing_job(db, key, practice.owner_user_id, request_hash)
     if previous:
         return previous
@@ -159,6 +187,10 @@ def enqueue(
         else "not_requested",
         "grammar": "queued" if kind == "grammar" else "not_requested",
     }
+    fake = not real or any(
+        config["stages"][name] == "fake" for name, state in stages.items() if state != "not_requested"
+    )
+    warning = FAKE_WARNING if not real else PARTIAL_WARNING if fake else REAL_WARNING
     value = Job(
         session_id=practice.id,
         audio_asset_id=asset.id if asset else None,
@@ -169,21 +201,58 @@ def enqueue(
         config_sha256=config_hash,
         provenance_json={
             "schema_version": 1,
-            "fake": True,
-            "backend": "fake-v1",
+            # Any requested fake stage keeps the whole job labelled fake.
+            "fake": fake,
+            "backend": config["backend"],
             "source_sha256": source.hexdigest(),
             "seed": 42,
             "dataset": "not_applicable",
-            "model": "no-model-test-double",
+            "model": f"asr:{config['asr_model']}@{config['asr_revision']};"
+            f"grammar:{config['grammar_model']}@{config['grammar_revision']}"
+            if real
+            else "no-model-test-double",
             "pilot": "not_run",
             "device": "cpu",
-            "warning": FAKE_WARNING,
+            "warning": warning,
         },
         stage_state_json=stages,
+        retry_of_job_id=retry_of.id if retry_of else None,
+        attempt_no=retry_of.attempt_no + 1 if retry_of else 1,
     )
     db.add(value)
     db.flush()
     return value
+
+
+def retry_job(db: Session, settings: Settings, user_id: str, jid: str, key: str) -> Job:
+    old = db.get(Job, jid)
+    if old is None:
+        raise HTTPException(404, "Not found")
+    practice = owned(db, user_id, old.session_id, lock=True)
+    # Idempotent replay must come before the "already retried" check below.
+    replay = db.scalar(select(Job).where(Job.idempotency_key == key))
+    if replay and replay.retry_of_job_id == jid and replay.session_id == old.session_id:
+        return replay
+    if old.status != "failed":
+        raise HTTPException(409, "Only failed jobs can be retried")
+    if db.scalar(select(Job.id).where(Job.retry_of_job_id == old.id)):
+        raise HTTPException(409, "Job already retried; retry the newest attempt")
+    if old.attempt_no >= MAX_ATTEMPTS:
+        raise HTTPException(409, "Retry limit reached")
+    asset = None
+    if old.kind == "grammar":
+        if (
+            practice.confirmed_transcript is None
+            or old.input_snapshot_json["revision"] != practice.transcript_revision
+        ):
+            raise HTTPException(409, "Transcript changed; confirm and queue a new analysis")
+    else:
+        asset = db.get(AudioAsset, old.audio_asset_id) if old.audio_asset_id else None
+        if not asset or asset.state != "ready" or asset.expires_at <= now():
+            raise HTTPException(409, "Audio unavailable; create a new session")
+    return enqueue(
+        db, settings, practice, old.kind, key, old.input_snapshot_json, asset, retry_of=old
+    )
 
 
 def save_audio(
@@ -201,7 +270,7 @@ def save_audio(
             "kind": "speech",
             "session_id": practice.id,
             "snapshot": snapshot,
-            "config": canonical_hash(ADAPTER_CONFIG),
+            "config": canonical_hash(adapter_config(settings)),
         }
     )
     existing = existing_job(db, key, practice.owner_user_id, request_hash)
@@ -260,7 +329,7 @@ def report(db: Session, practice: PracticeSession) -> dict:
                     "warnings": g.warnings_json,
                     "is_current": g.transcript_revision == practice.transcript_revision
                     and practice.confirmed_transcript is not None,
-                    "fake": True,
+                    "fake": job.provenance_json.get("fake", True),
                 }
             )
         p = db.scalar(select(PronunciationResult).where(PronunciationResult.job_id == job.id))
@@ -271,12 +340,16 @@ def report(db: Session, practice: PracticeSession) -> dict:
                     "score": p.score,
                     "evidence": p.evidence_json,
                     "feedback": p.feedback_json,
-                    "fake": True,
+                    "fake": job.provenance_json.get("fake", True),
                 }
             )
     return {
-        "fake": True,
-        "warning": FAKE_WARNING,
+        "fake": any(job.provenance_json.get("fake", True) for job in jobs) or not jobs,
+        # Real-backend jobs carry their own warning; fake-v1 jobs fall back to FAKE_WARNING.
+        "warning": next(
+            (w for job in jobs if (w := job.provenance_json.get("warning", FAKE_WARNING)) != FAKE_WARNING),
+            FAKE_WARNING,
+        ),
         "rule_version": "separate-evidence-v1",
         "jobs": [job_view(job) for job in jobs],
         "grammar": grammar,
@@ -313,7 +386,7 @@ def delete_practice(database, settings: Settings, owner: str, sid: str) -> bool:
         ids = select(Job.id).where(Job.session_id == sid)
         db.execute(delete(GrammarResult).where(GrammarResult.job_id.in_(ids)))
         db.execute(delete(PronunciationResult).where(PronunciationResult.job_id.in_(ids)))
-        db.execute(delete(Job).where(Job.session_id == sid))  # retry endpoint deliberately absent
+        db.execute(delete(Job).where(Job.session_id == sid))
         db.execute(delete(AudioAsset).where(AudioAsset.session_id == sid))
         db.execute(delete(PracticeSession).where(PracticeSession.id == sid))
         remaining = db.scalar(
@@ -322,3 +395,21 @@ def delete_practice(database, settings: Settings, owner: str, sid: str) -> bool:
         if not remaining:
             db.execute(delete(Consent).where(Consent.id == consent_id))
     return True
+
+
+def withdraw_consent(database, settings: Settings, owner: str, cid: str) -> bool:
+    """Block new jobs, then delete every session that used this consent."""
+    with database.sessions.begin() as db:
+        write_lock(db)
+        consent = db.get(Consent, cid)
+        if consent is None or consent.owner_user_id != owner:
+            raise HTTPException(404, "Not found")
+        consent.withdrawn_at = consent.withdrawn_at or now()
+        sids = list(db.scalars(select(PracticeSession.id).where(PracticeSession.consent_id == cid)))
+    pending = False
+    for sid in sids:
+        try:
+            pending |= not delete_practice(database, settings, owner, sid)
+        except HTTPException:
+            pass  # scheduler cleanup deleted it first
+    return not pending

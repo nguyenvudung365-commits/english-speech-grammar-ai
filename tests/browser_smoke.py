@@ -12,7 +12,11 @@ from playwright.sync_api import expect, sync_playwright
 
 def main():
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        browser = playwright.chromium.launch(
+            channel="msedge",
+            headless=True,
+            args=["--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"],
+        )
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -51,6 +55,19 @@ def main():
             )
             page.get_by_role("button", name="Upload & queue FAKE speech analysis", exact=True).click()
             expect(page.locator("#feedback")).to_contain_text("FAKE pronunciation", timeout=15000)
+            expect(page.locator("#transcript")).not_to_have_value("")
+            # Microphone path: fake device -> Web Audio -> browser WAV -> existing /audio endpoint.
+            page.get_by_role("button", name="Agree & create practice", exact=True).click()
+            page.wait_for_timeout(500)
+            audio_posts = []
+            page.on("response", lambda r: audio_posts.append(r.status) if r.url.endswith("/audio") and r.request.method == "POST" else None)
+            page.locator("#transcript").fill("")
+            page.get_by_role("button", name="Record (max 30 s)").click()
+            expect(page.locator("#stop-record")).to_be_visible()
+            page.wait_for_timeout(2000)
+            page.locator("#stop-record").click()
+            expect(page.locator("#feedback")).to_contain_text("FAKE pronunciation", timeout=15000)
+            assert audio_posts == [201], audio_posts
             expect(page.locator("#transcript")).not_to_have_value("")
             for width in (1280, 390):
                 page.set_viewport_size({"width": width, "height": 900})

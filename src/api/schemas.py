@@ -42,3 +42,7 @@ class TranscriptInput(RevisionInput):
 
 class GrammarInput(RevisionInput):
     idempotency_key: UUID
+
+
+class RetryInput(StrictModel):
+    idempotency_key: UUID

@@ -15,13 +15,14 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
-from src.api.config import FAKE_WARNING, MAX_AUDIO_BYTES, Settings
+from src.api.config import FAKE_WARNING, MAX_AUDIO_BYTES, PARTIAL_WARNING, Settings
 from src.api.db import Database
 from src.api.models import AudioAsset, AuthSession, Consent, Job, PracticeSession, User, now
 from src.api.schemas import (
     ConsentInput,
     Credentials,
     GrammarInput,
+    RetryInput,
     RevisionInput,
     SessionInput,
     TranscriptInput,
@@ -34,8 +35,10 @@ from src.api.services import (
     job_view,
     owned,
     report,
+    retry_job,
     save_audio,
     session_view,
+    withdraw_consent,
     write_lock,
 )
 from src.api.storage import private_path, validate_wav
@@ -156,7 +159,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
                     token = secrets.token_urlsafe(32)
                     auth.csrf_hash = token_hash(token)
         set_cookie(response, request, "csrf", token, settings.session_hours * 3600, False)
-        return {"csrf_token": token}
+        return {"csrf_token": token, "backend": settings.adapter_backend}
 
     @app.post("/api/auth/register", status_code=201)
     def register(payload: Credentials):
@@ -187,7 +190,12 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
 
     @app.get("/api/me")
     def me(user: CurrentUser):
-        return {"id": user, "fake": True, "warning": FAKE_WARNING}
+        return {
+            "id": user,
+            "fake": settings.adapter_backend == "fake",
+            "backend": settings.adapter_backend,
+            "warning": FAKE_WARNING if settings.adapter_backend == "fake" else PARTIAL_WARNING,
+        }
 
     @app.post("/api/consents", status_code=201)
     def consent(payload: ConsentInput, user: CurrentUser):
@@ -200,6 +208,12 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
                 "policy_version": value.policy_version,
                 "accepted_at": value.accepted_at,
             }
+
+    @app.post("/api/consents/{cid}/withdraw")
+    def withdraw(cid: UUID, response: Response, user: CurrentUser):
+        done = withdraw_consent(database, settings, user, str(cid))
+        response.status_code = 200 if done else 202
+        return {"status": "withdrawn" if done else "deletion_pending"}
 
     @app.post("/api/sessions", status_code=201)
     def create_session(payload: SessionInput, user: CurrentUser):
@@ -301,6 +315,12 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             )
             return job_view(job)
 
+    @app.post("/api/jobs/{jid}/retry", status_code=201)
+    def retry(jid: UUID, payload: RetryInput, user: CurrentUser):
+        with database.sessions.begin() as db:
+            write_lock(db)
+            return job_view(retry_job(db, settings, user, str(jid), str(payload.idempotency_key)))
+
     @app.post("/api/sessions/{sid}/audio", status_code=201)
     async def audio_upload(sid: UUID, request: Request, user: CurrentUser):
         # Raw WAV protocol avoids multipart parser reading audio before authorization/consent.
@@ -334,7 +354,7 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
                         "expires_at": asset.expires_at,
                         "frame_count": asset.frame_count,
                         "sample_rate_hz": 16000,
-                        "fake": True,
+                        "fake": job.provenance_json.get("fake", True),
                     }
                 return result
             except Exception:
@@ -378,8 +398,8 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             # Minimal data export: no free text, identifiers, paths, hashes or timestamps.
             return {
                 "schema_version": 1,
-                "fake": True,
-                "warning": FAKE_WARNING,
+                "fake": value["fake"],
+                "warning": value["warning"],
                 "privacy": "Content-free technical summary; not a guarantee of anonymization",
                 "jobs": [
                     {"kind": item["kind"], "status": item["status"], "stages": item["stages"]}

@@ -2,15 +2,17 @@
 
 Ứng dụng hỗ trợ luyện tiếng Anh, hướng tới đánh giá phát âm và sửa lỗi ngữ pháp bằng các mô hình học sâu. Dự án được phát triển trong khuôn khổ môn **Học máy nâng cao**.
 
-> **Trạng thái hiện tại:** bản demo chạy local để kiểm chứng luồng ứng dụng. ASR, sửa ngữ pháp và đánh giá phát âm đều dùng **FAKE / TEST DOUBLE**, chưa tích hợp mô hình học máy thật. Kết quả demo không dùng để đánh giá năng lực tiếng Anh.
+> **Trạng thái hiện tại:** bản demo chạy local để kiểm chứng luồng ứng dụng. Mặc định (`ADAPTER_BACKEND=fake`) ASR, sửa ngữ pháp và đánh giá phát âm đều là **FAKE / TEST DOUBLE**. Tùy chọn `ADAPTER_BACKEND=real` chạy ASR và sửa ngữ pháp bằng mô hình pretrained (chưa đánh giá chất lượng); **phát âm vẫn là FAKE, không có điểm**. Kết quả không dùng để đánh giá năng lực tiếng Anh.
 
 ## Chức năng hiện có
 
 - Đăng ký, đăng nhập, đăng xuất và xóa tài khoản; mật khẩu được băm bằng Argon2.
 - Ghi nhận sự đồng ý trước khi tạo phiên luyện tập.
-- Hỗ trợ nhập văn bản, nói tự do và đọc theo câu mẫu; luồng âm thanh sử dụng file WAV tải lên.
+- Hỗ trợ nhập văn bản, nói tự do và đọc theo câu mẫu; luồng âm thanh dùng file WAV tải lên hoặc thu âm microphone trên trình duyệt (mã hóa WAV 16 kHz; cần `127.0.0.1`/`localhost` hoặc HTTPS).
 - Lưu bản nháp và xác nhận phiên bản transcript trước khi gửi phân tích ngữ pháp.
 - Xử lý job bất đồng bộ bằng worker riêng, hàng đợi PostgreSQL và cơ chế lease.
+- Thử lại job `failed` bằng `POST /api/jobs/{jid}/retry` (tạo job mới, tối đa 3 lần/chuỗi).
+- Rút consent bằng `POST /api/consents/{cid}/withdraw`: chặn job mới và xóa mọi phiên dùng consent đó.
 - Xem lịch sử, báo cáo kết quả và xóa phiên luyện tập.
 - Lưu âm thanh riêng tư và dọn dữ liệu hết hạn bằng scheduler.
 - Giao diện web tĩnh đi kèm API; tài liệu OpenAPI tại `/docs` khi chạy ứng dụng.
@@ -19,10 +21,10 @@
 
 | Thành phần | Cách hoạt động hiện tại |
 |---|---|
-| ASR | Trả transcript mẫu cố định, không nhận dạng nội dung âm thanh thực tế |
-| Ngữ pháp | Một số cặp ví dụ sửa lỗi định sẵn, không phải mô hình tổng quát |
-| Phát âm | Trả phản hồi giả lập, không có điểm đánh giá đã hiệu chuẩn |
-| Tổng hợp phản hồi | Giữ riêng bằng chứng từng thành phần và gắn nhãn FAKE |
+| ASR | Mặc định trả transcript mẫu cố định. Với `ADAPTER_BACKEND=real` dùng faster-whisper `base.en` (CPU, int8) nhận dạng âm thanh thật; chưa có số liệu WER |
+| Ngữ pháp | Mặc định: hai cặp ví dụ định sẵn. Với `real`: `Unbabel/gec-t5_small` (T5-small, greedy, CPU); kết quả luôn qua kiểm tra span và chặn việc bỏ `not`/`never`/`no`; chưa có số liệu chất lượng |
+| Phát âm | Luôn FAKE ở cả hai backend: không có điểm, không phân tích âm học |
+| Tổng hợp phản hồi | Giữ riêng bằng chứng từng thành phần; job gắn nhãn FAKE nếu có stage FAKE được yêu cầu (job chỉ ngữ pháp ở backend `real` không gắn FAKE) |
 
 ## Ảnh giao diện và chức năng
 
@@ -135,6 +137,31 @@ Script tạo `.env` với mật khẩu PostgreSQL ngẫu nhiên và **không ghi
 | `COOKIE_SECURE` | `false` chỉ dành cho HTTP localhost |
 | `QUEUE_GLOBAL` | Giới hạn hàng đợi toàn hệ thống, mặc định `32` |
 | `QUEUE_PER_USER` | Giới hạn hàng đợi mỗi người dùng, mặc định `4` |
+| `ADAPTER_BACKEND` | `fake` (mặc định) hoặc `real` (ASR + ngữ pháp thật; phát âm vẫn FAKE) |
+| `ASR_MODEL`, `ASR_REVISION`, `GRAMMAR_MODEL`, `GRAMMAR_REVISION` | Thư mục model cục bộ và commit Hugging Face của từng model. Bắt buộc khác rỗng khi `real`, thiếu thì cấu hình báo lỗi ngay lúc khởi động |
+
+Mô hình thật (tùy chọn, cần Internet một lần; thư mục `models/` nằm ngoài Git). Torch phải là bản CPU:
+
+```powershell
+.\.venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+.\.venv\Scripts\python -m pip install -e ".[ml]"
+.\.venv\Scripts\python -c "from faster_whisper import download_model; download_model('base.en', output_dir='models/asr/base.en')"
+.\.venv\Scripts\python -c "from huggingface_hub import snapshot_download as d; d('Unbabel/gec-t5_small', revision='c958d53bfbce19c87342b69fc6bcaba7303d076f', local_dir='models/grammar/gec-t5_small', allow_patterns=['*.json','*.bin','spiece.model','README.md'])"
+# trong .env: ADAPTER_BACKEND=real
+#   ASR_MODEL=models/asr/base.en                  ASR_REVISION=3d3d5dee26484f91867d81cb899cfcf72b96be6c
+#   GRAMMAR_MODEL=models/grammar/gec-t5_small     GRAMMAR_REVISION=c958d53bfbce19c87342b69fc6bcaba7303d076f
+```
+
+| Model | License (đọc trên model card) | Commit | Dung lượng |
+|---|---|---|---|
+| [`Systran/faster-whisper-base.en`](https://huggingface.co/Systran/faster-whisper-base.en) (ASR) | MIT | `3d3d5dee26484f91867d81cb899cfcf72b96be6c` | 141 MB trong `models/asr` |
+| [`Unbabel/gec-t5_small`](https://huggingface.co/Unbabel/gec-t5_small) (ngữ pháp) | Apache-2.0 | `c958d53bfbce19c87342b69fc6bcaba7303d076f` | 233 MB trong `models/grammar` (checkpoint 242 MB) |
+
+Model card `Unbabel/gec-t5_small` ghi huấn luyện trên clang-8, CoNLL-13/14; điều khoản của dữ liệu huấn luyện chưa được kiểm trong dự án này. Cài extra `ml` thêm khoảng 787 MB vào `.venv` (505 MB lên 1292 MB; torch 2.15.0+cpu, transformers 5.22.2, sentencepiece 0.2.3).
+
+Model nạp một lần khi worker khởi động, chỉ từ thư mục cục bộ (`local_files_only`, không tải lúc chạy). `src/api` không import torch/transformers. Job xếp hàng trước khi đổi backend sẽ thất bại `CONFIG_MISMATCH`; bấm Retry để chạy lại với cấu hình hiện tại. Câu dài hơn 128 token thất bại `INPUT_TOO_LONG`; đầu ra sai hợp đồng hoặc bỏ phủ định thất bại `INVALID_ADAPTER_OUTPUT`. Một stage chạy quá 120 s sẽ mất lease (`WORKER_LOST`).
+
+**Độ trễ đo thật** (máy dev Windows 11, CPU 12 luồng logic, không GPU, một tiến trình, file WAV 6,655 s): nạp toàn bộ (import + ASR + grammar) 10,65 s; ASR lần đầu (cold) 1,61 s, các lần sau (warm) 1,17-1,20 s; grammar lần đầu 0,37 s, các lần sau 0,14-0,33 s (câu ngắn, greedy). Đây là số đo một máy, một file, không phải benchmark chất lượng. Mẫu đầu ra grammar thật: `He go to school every day.` thành `He goes to school every day.`; `She don't like apples.` thành `She doesn't like apples.`; `I like to swimming` thành `I like swimming.`; câu đúng `She goes to school every day.` giữ nguyên.
 
 Mật khẩu của volume PostgreSQL đã khởi tạo **không tự thay đổi** khi sửa `.env`. Không chia sẻ hoặc commit `.env`.
 
@@ -179,9 +206,9 @@ Mở ba cửa sổ CMD tại thư mục dự án.
 2. Chọn chế độ, đồng ý chính sách và tạo phiên luyện tập.
 3. Với nhập chữ: nhập `He go home.` → **Save draft** → **Confirm saved revision** → **Queue FAKE grammar**.
 4. Với âm thanh: tải file WAV hợp lệ; chế độ đọc mẫu cần thêm câu tham chiếu. Xác nhận transcript trước khi gửi phân tích ngữ pháp.
-5. Xem phản hồi có nhãn FAKE và lịch sử; có thể xóa phiên hoặc tài khoản sau khi thử.
+5. Xem phản hồi (có nhãn FAKE khi backend `fake`) và lịch sử; Retry job `failed`; có thể rút consent, xóa phiên hoặc tài khoản sau khi thử.
 
-**Yêu cầu audio:** WAV PCM16, mono, 16 kHz, tối đa 30 giây và 10 MiB. Bản demo chưa ghi âm microphone hoặc chuyển đổi MP3/WebM. Worker phải chạy thì job mới được xử lý.
+**Yêu cầu audio:** WAV PCM16, mono, 16 kHz, tối đa 30 giây và 10 MiB. Trình duyệt tự mã hóa WAV khi thu âm; bản demo không chuyển đổi MP3/WebM phía server. Worker phải chạy thì job mới được xử lý.
 
 ### Dừng ứng dụng
 
@@ -211,6 +238,8 @@ Nếu chạy pytest mà không đặt `TEST_DATABASE_URL`, các test cần Postg
 
 ```cmd
 node --test tests/refresh-race.test.cjs
+node --test tests/fake-label.test.cjs
+node --test tests/ui-logic.test.cjs
 .venv\Scripts\python.exe -m ruff check src tests migrations
 ```
 
@@ -231,5 +260,6 @@ Smoke test kiểm tra luồng nhập chữ, upload WAV, phản hồi giả lập
 - Scheduler xóa nội dung phiên và kết quả sau 24 giờ, kể cả phiên chỉ nhập chữ. Tùy chọn giữ dữ liệu dẫn xuất chưa được thực hiện vì chưa xác minh khả năng ẩn danh.
 - Việc xóa tự động phụ thuộc scheduler đang chạy; khi máy tắt không thể bảo đảm xóa đúng thời điểm. Backup có vòng đời riêng do người vận hành quản lý.
 - Cấu hình hiện tại **chỉ dành cho localhost**, chưa sẵn sàng mở ra Internet: chưa có HTTPS deployment, email verification, quên mật khẩu, backup và giám sát production.
-- Rate limit chỉ có hiệu lực trong từng tiến trình. Job mất worker chuyển thành `WORKER_LOST`, chưa có API retry.
-- Chưa có model thật, bộ dữ liệu đánh giá hoặc kết quả thực nghiệm để công bố. Tích hợp và đánh giá các mô hình phát âm, ASR, ngữ pháp là hướng phát triển tiếp theo, không phải chức năng đã hoàn thành.
+- Rate limit chỉ có hiệu lực trong từng tiến trình. Job mất worker chuyển thành `WORKER_LOST`, người dùng có thể thử lại job `failed` (tối đa 3 lần/chuỗi, tạo job mới).
+- Backend `real` đã tích hợp ASR và ngữ pháp pretrained nhưng **chưa có bộ dữ liệu đánh giá hoặc số liệu chất lượng** (WER, F0.5); đầu ra có thể sai, câu không có edit không chứng tỏ đúng ngữ pháp. Đánh giá phát âm chưa được làm (không có điểm).
+- Thu âm microphone dùng `ScriptProcessorNode` (đã deprecated) và cần secure context. Ảnh chụp màn hình ở trên là của bản FAKE, chưa chụp lại với backend `real`.

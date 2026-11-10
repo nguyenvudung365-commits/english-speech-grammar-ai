@@ -11,8 +11,8 @@
 <a class="skip" href="#main">Skip to content</a>
 <header><p class="eyebrow">ENGLISH PRACTICE / LOCAL LAB</p><h1>Speak. Review. Refine.</h1>
 <p>A small, private workflow for testing the learning experience.</p></header>
-<aside class="banner" aria-label="Test double disclaimer"><strong>FAKE / TEST DOUBLE DEMO</strong>
-<p>No real language models run here. ASR always returns a canned sentence; grammar has only two examples. Pronunciation is not assessed and has no score. This is not evidence of ML quality.</p></aside>
+<aside class="banner" aria-label="Test double disclaimer"><strong id="banner-title">FAKE / TEST DOUBLE DEMO</strong>
+<p id="banner-text">No real language models run here. ASR always returns a canned sentence; grammar has only two examples. Pronunciation is not assessed and has no score. This is not evidence of ML quality. (With the optional real backend, ASR and grammar come from local models and may be wrong; pronunciation stays unassessed.)</p></aside>
 <main id="main">
   <p id="status" role="status" aria-live="polite" aria-atomic="true">Connecting…</p>
   <section id="auth" aria-labelledby="auth-title">
@@ -47,8 +47,9 @@
           <p id="revision" class="hint"></p>
           <form id="upload-form">
             <label for="audio">Optional audio — WAV PCM16, mono, 16 kHz only</label>
-            <p id="audio-help" class="hint">Up to 30 seconds / 10 MiB. No microphone recording or codec conversion in this slice. The separate worker must be running.</p>
+            <p id="audio-help" class="hint">Up to 30 seconds / 10 MiB. Record in the browser (needs localhost or HTTPS) or upload a WAV; no codec conversion. The separate worker must be running.</p>
             <input id="audio" type="file" accept="audio/wav,.wav" aria-describedby="audio-help">
+            <button type="button" id="record" class="secondary">Record (max 30 s)</button><button type="button" id="stop-record" class="secondary" hidden>Stop</button>
             <button type="submit" class="secondary">Upload & queue FAKE speech analysis</button>
           </form>
           <label for="transcript">Your draft / edited transcript</label><textarea id="transcript" rows="5" maxlength="3000" aria-describedby="transcript-help"></textarea>
@@ -58,7 +59,7 @@
         <section id="results" hidden aria-labelledby="results-title">
           <h2 id="results-title">3. Feedback & job status</h2>
           <p id="report-state"></p><div id="job-list"></div><div id="feedback"></div>
-          <div class="actions"><button id="refresh" class="secondary">Refresh report</button><button id="export" class="secondary">Export content-free JSON</button><button id="delete-session" class="danger">Delete this practice</button></div>
+          <div class="actions"><button id="refresh" class="secondary">Refresh report</button><button id="export" class="secondary">Export content-free JSON</button><button id="delete-session" class="danger">Delete this practice</button><button id="withdraw-consent" class="danger">Withdraw consent &amp; delete all its practices</button></div>
         </section>
       </div>
       <aside class="history" aria-labelledby="history-title"><h2 id="history-title">Your history</h2><p class="hint">Only your unexpired, undeleted practices.</p><button id="history-refresh" class="secondary">Refresh history</button><ul id="history-list"></ul></aside>

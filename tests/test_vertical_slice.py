@@ -632,3 +632,473 @@ def test_cleanup_tolerates_orphan_disappearing_before_stat(app, monkeypatch):
 
     monkeypatch.setattr(Path, "stat", disappeared)
     cleanup(app.state.db, app.state.settings)
+
+
+# --- Job retry (plan .claude/plans/job-retry-api.md, section 4) ---
+
+
+def retry(client, jid, key=None):
+    return client.post(f"/api/jobs/{jid}/retry", json={"idempotency_key": key or str(uuid.uuid4())})
+
+
+def fail_speech(app, client, sid):
+    """Upload, claim, expire lease -> WORKER_LOST failed job; returns job id."""
+    jid = upload(client, sid).json()["job_id"]
+    assert claim_job(app.state.db, "worker-a") == jid
+    with app.state.db.sessions.begin() as db:
+        db.get(Job, jid).lease_expires_at -= timedelta(hours=1)
+    assert expire_leases(app.state.db) == 1
+    return jid
+
+
+def fail_grammar_job(app, client, sid, text="He go home."):
+    from src.worker.fakes import FakeAdapters
+
+    draft(client, sid, text)
+    client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+    jid = grammar(client, sid).json()["id"]
+    run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+    assert client.get(f"/api/jobs/{jid}").json()["status"] == "failed"
+    return jid
+
+
+def job_count(app):
+    with app.state.db.sessions() as db:
+        return len(list(db.scalars(select(Job))))
+
+
+def test_retry_worker_lost_speech_creates_new_job(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_speech(app, client, sid)
+        response = retry(client, jid)
+        assert response.status_code == 201, response.text
+        new = response.json()
+        assert new["id"] != jid
+        assert (new["status"], new["kind"], new["attempt_no"], new["retry_of_job_id"]) == (
+            "queued",
+            "speech",
+            2,
+            jid,
+        )
+        old = client.get(f"/api/jobs/{jid}").json()
+        assert (old["status"], old["error_code"]) == ("failed", "WORKER_LOST")
+        assert run_once(app.state.db, app.state.settings)
+        assert client.get(f"/api/jobs/{new['id']}").json()["status"] == "succeeded"
+        assert len(client.get(f"/api/sessions/{sid}/report").json()["jobs"]) == 2
+
+
+def test_retry_grammar_failed_then_current_result(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_grammar_job(app, client, sid)
+        response = retry(client, jid)
+        assert response.status_code == 201, response.text
+        assert run_once(app.state.db, app.state.settings)
+        assert client.get(f"/api/jobs/{response.json()['id']}").json()["status"] == "succeeded"
+        results = client.get(f"/api/sessions/{sid}/report").json()["grammar"]
+        assert results and results[0]["is_current"] is True
+
+
+def test_retry_idempotent_and_original_key_rejected(app):
+    from src.worker.fakes import FakeAdapters
+
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_grammar_job(app, client, sid)
+        key = str(uuid.uuid4())
+        first = retry(client, jid, key)
+        second = retry(client, jid, key)
+        assert first.status_code == 201 and second.status_code == 201
+        assert first.json()["id"] == second.json()["id"]
+        assert job_count(app) == 2
+    with TestClient(app) as client:
+        login(client, "b@example.com")
+        sid = session(client)
+        draft(client, sid)
+        client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+        original_key = str(uuid.uuid4())
+        jid = grammar(client, sid, key=original_key).json()["id"]
+        # Drain the first user's retry job, then fail this one.
+        while run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True)):
+            pass
+        assert client.get(f"/api/jobs/{jid}").json()["status"] == "failed"
+        before = job_count(app)
+        assert retry(client, jid, original_key).status_code == 409
+        assert job_count(app) == before
+
+
+def test_retry_only_chain_head_and_limit(app):
+    from src.worker.fakes import FakeAdapters
+
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        first = fail_grammar_job(app, client, sid)
+        second = retry(client, first).json()["id"]
+        assert retry(client, first).status_code == 409  # already retried
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+        third = retry(client, second)
+        assert third.status_code == 201 and third.json()["attempt_no"] == 3
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+        assert client.get(f"/api/jobs/{third.json()['id']}").json()["status"] == "failed"
+        before = job_count(app)
+        assert retry(client, third.json()["id"]).status_code == 409
+        assert job_count(app) == before
+
+
+def test_retry_non_failed_jobs_rejected(app):
+    from src.worker.fakes import FakeAdapters
+
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        draft(client, sid)
+        client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+        queued = grammar(client, sid).json()["id"]
+        assert retry(client, queued).status_code == 409
+        assert claim_job(app.state.db, "worker-a") == queued  # now running
+        assert retry(client, queued).status_code == 409
+        assert complete_job(app.state.db, app.state.settings, queued, "worker-a")
+        assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
+        assert retry(client, queued).status_code == 409
+        partial_sid = session(client, "reference_reading")
+        partial = upload(client, partial_sid).json()["job_id"]
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_pronunciation=True))
+        assert client.get(f"/api/jobs/{partial}").json()["status"] == "partial"
+        before = job_count(app)
+        assert retry(client, partial).status_code == 409
+        assert job_count(app) == before
+
+
+def test_retry_rejected_when_transcript_changed(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_grammar_job(app, client, sid)
+        assert draft(client, sid, "She do not like coffee.", 1).status_code == 200
+        assert retry(client, jid).status_code == 409
+        assert job_count(app) == 1
+
+
+def test_retry_speech_with_expired_audio_not_queued(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_speech(app, client, sid)
+        with app.state.db.sessions.begin() as db:
+            asset = db.scalar(select(AudioAsset).where(AudioAsset.session_id == sid))
+            asset.expires_at -= timedelta(days=2)
+            asset.created_at -= timedelta(days=2)
+        # owned() treats the expired session as gone.
+        assert retry(client, jid).status_code == 404
+        assert job_count(app) == 1
+
+
+def test_retry_idor_csrf_queue_cap_and_withdrawn_consent(app):
+    from src.api.models import Consent, now
+
+    with TestClient(app) as a, TestClient(app) as b:
+        login(a)
+        sid = session(a)
+        jid = fail_grammar_job(app, a, sid)
+        login(b, "b@example.com")
+        assert retry(b, jid).status_code == 404
+        assert job_count(app) == 1
+        token = a.headers.pop("X-CSRF-Token")
+        assert retry(a, jid).status_code == 403
+        a.headers["X-CSRF-Token"] = token
+        app.state.settings.queue_per_user = 1
+        other = session(a)
+        draft(a, other)
+        a.post(f"/api/sessions/{other}/confirm", json={"expected_revision": 1})
+        assert grammar(a, other).status_code == 201
+        assert retry(a, jid).status_code == 429
+        app.state.settings.queue_per_user = 5
+        with app.state.db.sessions.begin() as db:
+            for consent in db.scalars(select(Consent)):
+                consent.withdrawn_at = now()
+        before = job_count(app)
+        assert retry(a, jid).status_code == 409
+        assert job_count(app) == before
+
+
+def test_retry_chain_job_view_fields_and_session_delete(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_grammar_job(app, client, sid)
+        new = retry(client, jid).json()
+        view = client.get(f"/api/jobs/{new['id']}").json()
+        assert view["attempt_no"] == 2 and view["retry_of_job_id"] == jid
+        assert client.get(f"/api/jobs/{jid}").json()["attempt_no"] == 1
+        for private in ("lease_owner", "request_sha256", "input_snapshot_json"):
+            assert private not in view
+        response = client.delete(f"/api/sessions/{sid}")
+        assert response.status_code == 200
+        assert response.json()["status"] == "deleted"
+        assert job_count(app) == 0
+
+
+# --- GD1 additions: retry detail strings, Audio unavailable, max_attempts ---
+
+
+def detail(response):
+    return response.json()["detail"]
+
+
+def test_retry_speech_with_missing_audio_conflict(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_speech(app, client, sid)
+        with app.state.db.sessions.begin() as db:
+            db.scalar(select(AudioAsset).where(AudioAsset.session_id == sid)).state = "missing"
+        response = retry(client, jid)
+        assert response.status_code == 409
+        assert detail(response) == "Audio unavailable; create a new session"
+        assert job_count(app) == 1
+
+
+def test_retry_rejection_details(app):
+    from src.worker.fakes import FakeAdapters
+
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        draft(client, sid)
+        client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+        first = grammar(client, sid).json()["id"]
+        assert detail(retry(client, first)) == "Only failed jobs can be retried"
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+        second = retry(client, first).json()["id"]
+        assert detail(retry(client, first)) == "Job already retried; retry the newest attempt"
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+        third = retry(client, second).json()["id"]
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+        response = retry(client, third)
+        assert response.status_code == 409 and detail(response) == "Retry limit reached"
+        unknown = retry(client, str(uuid.uuid4()))
+        assert unknown.status_code == 404 and detail(unknown) == "Not found"
+
+
+def test_retry_transcript_changed_detail(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_grammar_job(app, client, sid)
+        draft(client, sid, "She do not like coffee.", 1)
+        response = retry(client, jid)
+        assert response.status_code == 409
+        assert detail(response) == "Transcript changed; confirm and queue a new analysis"
+
+
+def test_retry_original_key_detail(app):
+    from src.worker.fakes import FakeAdapters
+
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        draft(client, sid)
+        client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+        key = str(uuid.uuid4())
+        jid = grammar(client, sid, key=key).json()["id"]
+        run_once(app.state.db, app.state.settings, FakeAdapters(fail_grammar=True))
+        response = retry(client, jid, key)
+        assert response.status_code == 409
+        assert detail(response) == "Idempotency key used for another input"
+
+
+def test_retry_idor_queue_and_consent_details(app):
+    from src.api.models import Consent, now
+
+    with TestClient(app) as a, TestClient(app) as b:
+        login(a)
+        sid = session(a)
+        jid = fail_grammar_job(app, a, sid)
+        login(b, "b@example.com")
+        response = retry(b, jid)
+        assert response.status_code == 404 and detail(response) == "Not found"
+        app.state.settings.queue_per_user = 1
+        other = session(a)
+        draft(a, other)
+        a.post(f"/api/sessions/{other}/confirm", json={"expected_revision": 1})
+        assert grammar(a, other).status_code == 201
+        response = retry(a, jid)
+        assert response.status_code == 429
+        assert detail(response) == "Local queue full; try again later"
+        app.state.settings.queue_per_user = 5
+        with app.state.db.sessions.begin() as db:
+            for consent in db.scalars(select(Consent)):
+                consent.withdrawn_at = now()
+        response = retry(a, jid)
+        assert response.status_code == 409 and detail(response) == "Consent no longer active"
+
+
+def test_retry_expired_audio_detail_is_not_found(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_speech(app, client, sid)
+        with app.state.db.sessions.begin() as db:
+            asset = db.scalar(select(AudioAsset).where(AudioAsset.session_id == sid))
+            asset.expires_at -= timedelta(days=2)
+            asset.created_at -= timedelta(days=2)
+        response = retry(client, jid)
+        assert response.status_code == 404 and detail(response) == "Not found"
+
+
+def test_job_view_has_max_attempts(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        jid = fail_grammar_job(app, client, sid)
+        assert client.get(f"/api/jobs/{jid}").json()["max_attempts"] == 3
+        jobs = client.get(f"/api/sessions/{sid}/report").json()["jobs"]
+        assert all(j["max_attempts"] == 3 for j in jobs)
+
+
+# --- GD2: withdraw consent ---
+
+
+def withdraw(client, cid):
+    return client.post(f"/api/consents/{cid}/withdraw")
+
+
+def consent_of(client, sid):
+    return client.get(f"/api/sessions/{sid}").json()["consent_id"]
+
+
+def counts(app):
+    from src.api.models import Consent, GrammarResult, PracticeSession
+
+    with app.state.db.sessions() as db:
+        return [
+            len(list(db.scalars(select(m))))
+            for m in (Job, GrammarResult, PracticeSession, Consent, AudioAsset)
+        ]
+
+
+def test_withdraw_deletes_sessions_results_and_audio(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        draft(client, sid)
+        client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+        grammar(client, sid)
+        assert run_once(app.state.db, app.state.settings)
+        cid = consent_of(client, sid)
+        payload = {"consent_id": cid, "mode": "reference_reading", "reference_text": "She goes home."}
+        sid2 = client.post("/api/sessions", json=payload).json()["id"]
+        assert upload(client, sid2).status_code == 201
+        assert list(app.state.settings.storage_root.glob("*.wav"))
+        response = withdraw(client, cid)
+        assert response.status_code == 200 and response.json() == {"status": "withdrawn"}
+        for s in (sid, sid2):
+            assert client.get(f"/api/sessions/{s}").status_code == 404
+        assert counts(app) == [0, 0, 0, 0, 0]
+        assert not list(app.state.settings.storage_root.glob("*.wav"))
+        # Criterion 8: consent already deleted by the chain, so a second call is 404.
+        assert withdraw(client, cid).status_code == 404
+
+
+def test_withdraw_does_not_touch_other_consents(app):
+    with TestClient(app) as client:
+        login(client)
+        keep = session(client)
+        gone = session(client)
+        assert withdraw(client, consent_of(client, gone)).status_code == 200
+        assert client.get(f"/api/sessions/{keep}").status_code == 200
+        assert client.get(f"/api/sessions/{gone}").status_code == 404
+
+
+def test_withdraw_cancels_queued_job(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        upload(client, sid)
+        assert withdraw(client, consent_of(client, sid)).status_code == 200
+        assert run_once(app.state.db, app.state.settings) is False
+        assert counts(app) == [0, 0, 0, 0, 0]
+
+
+def test_withdraw_running_job_is_pending_blocks_new_and_no_late_results(app):
+    from src.api.models import Consent, GrammarResult
+
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        draft(client, sid)
+        client.post(f"/api/sessions/{sid}/confirm", json={"expected_revision": 1})
+        jid = grammar(client, sid).json()["id"]
+        cid = consent_of(client, sid)
+        assert claim_job(app.state.db, "worker") == jid
+        response = withdraw(client, cid)
+        assert response.status_code == 202 and response.json() == {"status": "deletion_pending"}
+        with app.state.db.sessions() as db:
+            assert db.get(Consent, cid).withdrawn_at is not None
+        blocked = client.post("/api/sessions", json={"consent_id": cid, "mode": "grammar_only"})
+        assert blocked.status_code == 409 and detail(blocked) == "Consent withdrawn"
+        complete_job(app.state.db, app.state.settings, jid, "worker")
+        with app.state.db.sessions() as db:
+            job = db.get(Job, jid)
+            assert (job.status, job.error_code) == ("failed", "DELETION_REQUESTED")
+            assert not list(db.scalars(select(GrammarResult)))
+        cleanup(app.state.db, app.state.settings)
+        assert counts(app) == [0, 0, 0, 0, 0]
+
+
+def test_withdraw_consent_without_sessions_blocks_new_session(app):
+    from src.api.models import Consent
+
+    with TestClient(app) as client:
+        login(client)
+        cid = client.post(
+            "/api/consents", json={"policy_version": "local-v1", "allow_server_processing": True}
+        ).json()["id"]
+        assert withdraw(client, cid).status_code == 200
+        with app.state.db.sessions() as db:
+            assert db.get(Consent, cid).withdrawn_at is not None
+        response = client.post("/api/sessions", json={"consent_id": cid, "mode": "grammar_only"})
+        assert response.status_code == 409
+
+
+def test_withdraw_idor_csrf_origin(app):
+    from src.api.models import Consent
+
+    with TestClient(app) as a, TestClient(app) as b:
+        login(a)
+        sid = session(a)
+        cid = consent_of(a, sid)
+        login(b, "b@example.com")
+        assert withdraw(b, cid).status_code == 404
+        assert withdraw(b, str(uuid.uuid4())).status_code == 404
+        with app.state.db.sessions() as db:
+            assert db.get(Consent, cid).withdrawn_at is None
+        evil = a.post(f"/api/consents/{cid}/withdraw", headers={"Origin": "https://evil.invalid"})
+        assert evil.status_code == 403
+        token = a.headers.pop("X-CSRF-Token")
+        assert withdraw(a, cid).status_code == 403
+        a.headers["X-CSRF-Token"] = token
+        with app.state.db.sessions() as db:
+            assert db.get(Consent, cid).withdrawn_at is None
+        assert a.get(f"/api/sessions/{sid}").status_code == 200
+
+
+def test_withdraw_requires_login_and_valid_uuid(app):
+    with TestClient(app) as client:
+        login(client)
+        assert client.post("/api/consents/not-a-uuid/withdraw").status_code == 422
+    with TestClient(app) as anon:
+        anon.headers["X-CSRF-Token"] = anon.get("/api/auth/csrf").json()["csrf_token"]
+        assert withdraw(anon, str(uuid.uuid4())).status_code == 401
+
+
+def test_session_view_has_own_consent_id(app):
+    with TestClient(app) as client:
+        login(client)
+        sid = session(client)
+        assert uuid.UUID(consent_of(client, sid))

@@ -20,7 +20,7 @@ from src.api.models import (
     User,
     now,
 )
-from src.api.services import delete_practice, write_lock
+from src.api.services import adapter_config, canonical_hash, delete_practice, write_lock
 from src.api.storage import private_path
 from src.worker.contracts import GrammarOutput
 from src.worker.fakes import AdapterFailure, FakeAdapters, LanguageAdapter
@@ -102,6 +102,7 @@ def complete_job(
         ):
             return False
         snapshot, kind, stages = job.input_snapshot_json, job.kind, dict(job.stage_state_json)
+        mismatch = job.config_sha256 != canonical_hash(adapter_config(settings))
         asset = db.get(AudioAsset, job.audio_asset_id) if job.audio_asset_id else None
         practice = db.get(PracticeSession, job.session_id)
         consent = db.get(Consent, practice.consent_id)
@@ -119,16 +120,21 @@ def complete_job(
     for stage, state in stages.items():
         if state == "not_requested":
             continue
+        # Keep the lease alive across slow stages; a lost lease means no result is written.
+        if not heartbeat(database, jid, owner):
+            return False
         try:
             if not allowed:
                 raise AdapterFailure("INPUT_UNAVAILABLE")
+            if mismatch:  # enqueued under another backend/config; user retries under the current one
+                raise AdapterFailure("CONFIG_MISMATCH")
             if stage == "asr":
                 result = adapters.asr(audio)
                 if not isinstance(result, str) or not result.strip() or len(result) > 3000:
                     raise ValueError("Invalid ASR output")
             elif stage == "pronunciation":
                 result = adapters.pronunciation(audio, snapshot["reference"])
-                if not isinstance(result, dict) or result.get("fake") is not True or result.get("score") is not None:
+                if not isinstance(result, dict) or not isinstance(result.get("fake"), bool) or result.get("score") is not None:
                     raise ValueError("Uncalibrated local adapters cannot produce scores")
             else:
                 result = GrammarOutput.model_validate(adapters.grammar(snapshot["text"])).validate_source(snapshot["text"])
@@ -181,7 +187,7 @@ def complete_job(
                     rubric_version="not-calibrated",
                     score=None,
                     evidence_json=p,
-                    feedback_json={"warning": FAKE_WARNING},
+                    feedback_json={"warning": value.provenance_json.get("warning", FAKE_WARNING)},
                 )
             )
         if "grammar" in outputs:
@@ -199,8 +205,8 @@ def complete_job(
             )
         value.stage_state_json = stages
         value.output_summary_json = {
-            "fake": True,
-            "warning": FAKE_WARNING,
+            "fake": value.provenance_json.get("fake", True),
+            "warning": value.provenance_json.get("warning", FAKE_WARNING),
             "errors": errors,
             "fusion_rule": "separate-evidence-v1",
         }
@@ -277,11 +283,19 @@ def main():
     args = parser.parse_args()
     settings = Settings()
     database = Database(settings.database_url)
+    adapters = None
+    if not args.cleanup:  # load once at startup, never per job
+        if settings.adapter_backend == "real":
+            from src.worker.real_adapters import RealAdapters
+
+            adapters = RealAdapters(settings)
+        else:
+            adapters = FakeAdapters()
     while True:
         if args.cleanup:
             cleanup(database, settings)
         else:
-            run_once(database, settings)
+            run_once(database, settings, adapters)
         if args.once:
             return
         time.sleep(60 if args.cleanup else 1)

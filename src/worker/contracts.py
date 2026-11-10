@@ -1,4 +1,6 @@
 """Validate test-double outputs before admitting them into durable results."""
+from difflib import SequenceMatcher
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -40,3 +42,22 @@ class GrammarOutput(BaseModel):
         if any(len(warning) > 500 for warning in self.warnings):
             raise ValueError("Warning too long")
         return self.model_dump()
+
+
+def edits_from_correction(source: str, corrected: str) -> list[dict]:
+    """Character-level non-overlapping edits that rebuild `corrected` from `source`."""
+    matcher = SequenceMatcher(None, source, corrected, autojunk=False)
+    edits = [
+        {
+            "start": i1,
+            "end": i2,
+            "replacement": corrected[j1:j2],
+            "type": "model-edit",
+            "explanation": "Suggested by the grammar model",
+        }
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+    ]
+    if len(edits) > 100:  # GrammarOutput cap: fall back to one whole-text replacement
+        edits = [{**edits[0], "start": 0, "end": len(source), "replacement": corrected}]
+    return edits
